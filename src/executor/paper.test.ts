@@ -6,7 +6,7 @@ const reserves: Reserves = { sol: 30_000_000_000n, token: 1_000_000_000_000n }; 
 // 1. Buy math matches independently-computed constant-product formula (feeBps=100 from default config/.env fallback)
 {
   const exec = new PaperExecutor(10);
-  const position = exec.buy("MintA", "pumpfun", 1, reserves);
+  const position = await exec.buy("MintA", "pumpfun", 1, reserves);
   assert.ok(position, "buy should succeed with sufficient balance");
 
   const feeBps = 100n;
@@ -22,7 +22,7 @@ const reserves: Reserves = { sol: 30_000_000_000n, token: 1_000_000_000_000n }; 
 // 2. Insufficient balance -> buy returns null, balance unchanged
 {
   const exec = new PaperExecutor(0.1);
-  const position = exec.buy("MintA", "pumpfun", 1, reserves);
+  const position = await exec.buy("MintA", "pumpfun", 1, reserves);
   assert.strictEqual(position, null);
   assert.strictEqual(exec.getState().balanceSol, 0.1);
 }
@@ -30,8 +30,8 @@ const reserves: Reserves = { sol: 30_000_000_000n, token: 1_000_000_000_000n }; 
 // 3. Partial sell reduces remaining tokens but keeps position open
 {
   const exec = new PaperExecutor(10);
-  const position = exec.buy("MintA", "pumpfun", 1, reserves)!;
-  const sellEntry = exec.sell(position.id, reserves, "manual", 0.5);
+  const position = (await exec.buy("MintA", "pumpfun", 1, reserves))!;
+  const sellEntry = await exec.sell(position.id, reserves, "manual", 0.5);
   assert.ok(sellEntry);
   const updated = exec.getState().positions.find((p) => p.id === position.id)!;
   assert.strictEqual(updated.status, "open");
@@ -42,9 +42,9 @@ const reserves: Reserves = { sol: 30_000_000_000n, token: 1_000_000_000_000n }; 
 // 4. Full sell closes the position and balance reflects proceeds
 {
   const exec = new PaperExecutor(10);
-  const position = exec.buy("MintA", "pumpfun", 1, reserves)!;
+  const position = (await exec.buy("MintA", "pumpfun", 1, reserves))!;
   const balanceAfterBuy = exec.getState().balanceSol;
-  const sellEntry = exec.sell(position.id, reserves, "take_profit", 1)!;
+  const sellEntry = (await exec.sell(position.id, reserves, "take_profit", 1))!;
   const updated = exec.getState().positions.find((p) => p.id === position.id)!;
   assert.strictEqual(updated.status, "closed");
   assert.strictEqual(updated.remainingTokenAmount, 0);
@@ -56,7 +56,7 @@ const reserves: Reserves = { sol: 30_000_000_000n, token: 1_000_000_000_000n }; 
 // 5. Selling a non-existent/closed position returns null
 {
   const exec = new PaperExecutor(10);
-  assert.strictEqual(exec.sell("nonexistent", reserves, "manual"), null);
+  assert.strictEqual(await exec.sell("nonexistent", reserves, "manual"), null);
 }
 
 console.log("paper.test.ts: all assertions passed");

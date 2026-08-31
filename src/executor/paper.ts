@@ -30,8 +30,10 @@ export class PaperExecutor {
     }
   }
 
-  /** Simulates a buy fill against the given reserves. Returns null if balance is insufficient. */
-  buy(mint: string, venue: Venue, solAmount: number, reserves: Reserves, pool?: string): Position | null {
+  /** Simulates a buy fill against the given reserves. Returns null if balance is insufficient.
+   *  Async only for interface parity with LiveExecutor (see src/executor/live.ts) — paper fills
+   *  are instant and never actually await anything. */
+  async buy(mint: string, venue: Venue, solAmount: number, reserves: Reserves, pool?: string): Promise<Position | null> {
     const solLamports = BigInt(Math.round(solAmount * LAMPORTS_PER_SOL));
     if (solLamports <= 0n || solLamports > this.balanceLamports) return null;
 
@@ -74,7 +76,7 @@ export class PaperExecutor {
   }
 
   /** Simulates a sell fill (full or partial) against the given reserves. Returns null if the position isn't open. */
-  sell(positionId: string, reserves: Reserves, reason: Position["exitReason"], fraction = 1): TradeLogEntry | null {
+  async sell(positionId: string, reserves: Reserves, reason: Position["exitReason"], fraction = 1): Promise<TradeLogEntry | null> {
     const position = this.positions.find((p) => p.id === positionId && p.status === "open");
     if (!position) return null;
 
@@ -113,6 +115,10 @@ export class PaperExecutor {
     this.trades.push(entry);
     return entry;
   }
+
+  /** No-op — paper balance is tracked in-memory, not fetched from chain. Exists only so App.ts
+   *  can call executor.refreshBalance() the same way for both PaperExecutor and LiveExecutor. */
+  async refreshBalance(): Promise<void> {}
 
   getState(): PaperState {
     return {

@@ -33,6 +33,17 @@ export const PUMP_AMM_EVENT_DISCRIMINATORS = {
 
 export const LAMPORTS_PER_SOL = 1_000_000_000;
 
+// pump.fun's Global.token_total_supply — a fixed protocol-wide constant applied to every standard
+// `create` call (verified directly against the live Global account: 1_000_000_000_000_000 raw
+// units = 1B tokens @ 6 decimals). Used as an instant default for mcap filtering on the live-copy
+// hot path, skipping a real RPC round trip (MintInfoCache.resolveTotalSupply) that was previously
+// costing ~0.5-1s per trade decision — verified via [timing] log instrumentation during live
+// testing. A non-standard mint (mayhem mode, or if pump.fun changes this constant) could have a
+// different real supply, making mcap slightly inaccurate for that one trade — an acceptable
+// tradeoff for a live copy-trading decision, where missing/mistiming the trade from slowness costs
+// far more than a slightly-off mcap filter reading.
+export const PUMP_STANDARD_TOKEN_SUPPLY_RAW = 1_000_000_000_000_000n;
+
 // Wrapped SOL's mint address — PumpSwap pools can have either side (base or quote) be the actual
 // SOL leg; there's no fixed convention, so every pool must be checked against this rather than
 // assumed. See src/pools/registry.ts, src/pricing/liveReserves.ts, src/ingestion/index.ts.

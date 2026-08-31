@@ -178,6 +178,37 @@ export const CreatePoolEventSchema: Schema = [
   ["is_mayhem_mode", "bool"],
 ] as const;
 
+// pump.fun's Global singleton account. PDA seed: ["global"], owned by PUMP_PROGRAM_ID.
+// NOTE: the singleton `fee_recipient` field below is legacy/unused by real trades (verified
+// against live TradeEvents: 0/7 samples matched it) — the program actually rotates fee recipients
+// across the `fee_recipients[7]` array. Every field up to and including that array must still be
+// listed here since borsh is positional, even though only `fee_recipients` is read downstream.
+export const GlobalAccountSchema: Schema = [
+  ["initialized", "bool"],
+  ["authority", "pubkey"],
+  ["fee_recipient", "pubkey"],
+  ["initial_virtual_token_reserves", "u64"],
+  ["initial_virtual_sol_reserves", "u64"],
+  ["initial_real_token_reserves", "u64"],
+  ["token_total_supply", "u64"],
+  ["fee_basis_points", "u64"],
+  ["withdraw_authority", "pubkey"],
+  ["enable_migrate", "bool"],
+  ["pool_migration_fee", "u64"],
+  ["creator_fee_basis_points", "u64"],
+  ["fee_recipients", "pubkeyArray7"],
+] as const;
+
+// PumpSwap's GlobalConfig singleton account — truncated to the leading fields we need
+// (protocol_fee_recipients). PDA seed: ["global_config"], owned by PUMP_AMM_PROGRAM_ID.
+export const GlobalConfigAccountSchema: Schema = [
+  ["admin", "pubkey"],
+  ["lp_fee_basis_points", "u64"],
+  ["protocol_fee_basis_points", "u64"],
+  ["disable_flags", "u8"],
+  ["protocol_fee_recipients", "pubkeyArray8"],
+] as const;
+
 export const PoolAccountSchema: Schema = [
   ["pool_bump", "u8"],
   ["index", "u16"],

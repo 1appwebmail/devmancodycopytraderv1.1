@@ -11,6 +11,7 @@ export interface PoolInfo {
   baseTokenAccount: string;
   quoteTokenAccount: string;
   virtualQuoteReserves: bigint; // extra offset added to the quote SPL balance for AMM pricing
+  coinCreator: string; // needed for the live executor's creator_vault PDA — unused by paper pricing
 }
 
 /** Caches decoded PumpSwap Pool accounts so we don't re-fetch static pool metadata on every poll. */
@@ -44,6 +45,7 @@ export class PoolRegistry {
         pool_base_token_account: string;
         pool_quote_token_account: string;
         virtual_quote_reserves: bigint;
+        coin_creator: string;
       }>(info.data.subarray(ANCHOR_ACCOUNT_DISCRIMINATOR_LEN), PoolAccountSchema);
 
       const resolved: PoolInfo = {
@@ -52,6 +54,7 @@ export class PoolRegistry {
         baseTokenAccount: data.pool_base_token_account,
         quoteTokenAccount: data.pool_quote_token_account,
         virtualQuoteReserves: BigInt(data.virtual_quote_reserves),
+        coinCreator: data.coin_creator,
       };
       this.cache.set(poolAddress, resolved);
       return resolved;

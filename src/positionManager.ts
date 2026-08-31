@@ -1,7 +1,8 @@
 import { Connection } from "@solana/web3.js";
 import { EventEmitter } from "node:events";
 import { config, type LadderTier } from "./config.js";
-import { PaperExecutor, type Reserves } from "./executor/paper.js";
+import type { Reserves } from "./executor/paper.js";
+import type { Executor } from "./executor/types.js";
 import { PoolRegistry } from "./pools/registry.js";
 import { getReservesForPosition } from "./pricing/liveReserves.js";
 import { priceSolPerToken } from "./pricing.js";
@@ -104,7 +105,7 @@ export class PositionMonitor extends EventEmitter {
 
   constructor(
     private connection: Connection,
-    private executor: PaperExecutor,
+    private executor: Executor,
     private poolRegistry: PoolRegistry,
   ) {
     super();
@@ -151,7 +152,7 @@ export class PositionMonitor extends EventEmitter {
 
     const ladder = checkLadderTiers(position, currentPrice, config.ladderTiers);
     if (ladder) {
-      const entry = this.executor.sell(position.id, reserves, "ladder_tp", ladder.fractionOfRemaining);
+      const entry = await this.executor.sell(position.id, reserves, "ladder_tp", ladder.fractionOfRemaining);
       if (entry) {
         position.ladderTiersHit.push(...ladder.tierIndexes);
         this.emit("exit", position, entry, "ladder_tp");
@@ -163,7 +164,7 @@ export class PositionMonitor extends EventEmitter {
     const reason = checkExitConditions(position, currentPrice);
     if (!reason) return;
 
-    const entry = this.executor.sell(position.id, reserves, reason, 1);
+    const entry = await this.executor.sell(position.id, reserves, reason, 1);
     if (entry) {
       this.emit("exit", position, entry, reason);
       persistState(this.executor.getState());

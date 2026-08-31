@@ -14,17 +14,24 @@
     "test:pumpswap-orientation": "tsx src/ingestion/verify_pumpswap_orientation.ts",
     "test:migration-fix": "tsx src/pricing/verify_migration_fix.ts",
     "preview:notifications": "tsx src/reporting/preview_notifications.ts",
-    "test": "tsx src/strategy.test.ts && tsx src/executor/paper.test.ts && tsx src/positionManager.test.ts && tsx src/reporting/tradeLog.test.ts",
+    "live:dry-run": "tsx src/live/dry_run.ts",
+    "live:verify-fee-recipients": "tsx src/live/verify_global_accounts.ts",
+    "test": "tsx src/strategy.test.ts && tsx src/executor/paper.test.ts && tsx src/positionManager.test.ts && tsx src/reporting/tradeLog.test.ts && tsx src/pricing/targetHoldings.test.ts",
     "build": "tsc -p ."
   },
   "dependencies": {
+    "@pump-fun/pump-sdk": "^1.36.0",
+    "@pump-fun/pump-swap-sdk": "^1.19.0",
+    "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.95.3",
     "@triton-one/yellowstone-grpc": "^4.0.2",
+    "bn.js": "^5.2.5",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.5",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/bn.js": "^5.2.0",
     "@types/node": "^22.7.4",
     "@types/ws": "^8.5.12",
     "tsx": "^4.19.1",

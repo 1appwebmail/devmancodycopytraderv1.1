@@ -16,7 +16,7 @@ function filters(overrides: Partial<FilterSettings> = {}): FilterSettings {
   };
 }
 
-const NO_CONTEXT: TradeContext = { mcapUsd: null, ageSeconds: null };
+const NO_CONTEXT: TradeContext = { mcapUsd: null, ageSeconds: null, sellFraction: null };
 const NO_FILTERS = filters();
 
 function trade(overrides: Partial<TradeEvent> = {}): TradeEvent {
@@ -77,11 +77,11 @@ function position(overrides: Partial<Position> = {}): Position {
   assert.strictEqual(decision, null);
 }
 
-// 4. Sell on a mint we hold -> copy sell
+// 4. Sell on a mint we hold -> copy sell, full exit when sellFraction is unknown (null)
 {
   const state: StrategyState = { openPositions: [position()] };
   const decision = evaluateTrade(trade({ direction: "sell", mint: "MintA111" }), state, NO_CONTEXT, NO_FILTERS);
-  assert.deepStrictEqual(decision, { kind: "sell", positionId: "pos1", reason: "copy_sell" });
+  assert.deepStrictEqual(decision, { kind: "sell", positionId: "pos1", reason: "copy_sell", fraction: 1 });
 }
 
 // 5. Sell on a mint we don't hold -> skip
@@ -94,49 +94,49 @@ function position(overrides: Partial<Position> = {}): Position {
 // 6. Mcap filter: within [min, max] -> buy allowed
 {
   const state: StrategyState = { openPositions: [] };
-  const decision = evaluateTrade(trade(), state, { mcapUsd: 50, ageSeconds: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
+  const decision = evaluateTrade(trade(), state, { mcapUsd: 50, ageSeconds: null, sellFraction: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
   assert.ok(decision && decision.kind === "buy");
 }
 
 // 7. Mcap filter: below min -> skip
 {
   const state: StrategyState = { openPositions: [] };
-  const decision = evaluateTrade(trade(), state, { mcapUsd: 5, ageSeconds: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
+  const decision = evaluateTrade(trade(), state, { mcapUsd: 5, ageSeconds: null, sellFraction: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
   assert.strictEqual(decision, null);
 }
 
 // 8. Mcap filter: above max -> skip
 {
   const state: StrategyState = { openPositions: [] };
-  const decision = evaluateTrade(trade(), state, { mcapUsd: 500, ageSeconds: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
+  const decision = evaluateTrade(trade(), state, { mcapUsd: 500, ageSeconds: null, sellFraction: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
   assert.strictEqual(decision, null);
 }
 
 // 9. Mcap filter active but mcap couldn't be resolved (null) -> skip, don't silently ignore the filter
 {
   const state: StrategyState = { openPositions: [] };
-  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
+  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: null, sellFraction: null }, filters({ minMcapUsd: 10, maxMcapUsd: 100 }));
   assert.strictEqual(decision, null);
 }
 
 // 10. Age filter: within [min, max] -> buy allowed
 {
   const state: StrategyState = { openPositions: [] };
-  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: 120 }, filters({ minAgeSeconds: 30, maxAgeSeconds: 600 }));
+  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: 120, sellFraction: null }, filters({ minAgeSeconds: 30, maxAgeSeconds: 600 }));
   assert.ok(decision && decision.kind === "buy");
 }
 
 // 11. Age filter: too young -> skip
 {
   const state: StrategyState = { openPositions: [] };
-  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: 5 }, filters({ minAgeSeconds: 30, maxAgeSeconds: 600 }));
+  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: 5, sellFraction: null }, filters({ minAgeSeconds: 30, maxAgeSeconds: 600 }));
   assert.strictEqual(decision, null);
 }
 
 // 12. Age filter: too old -> skip
 {
   const state: StrategyState = { openPositions: [] };
-  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: 9999 }, filters({ minAgeSeconds: 30, maxAgeSeconds: 600 }));
+  const decision = evaluateTrade(trade(), state, { mcapUsd: null, ageSeconds: 9999, sellFraction: null }, filters({ minAgeSeconds: 30, maxAgeSeconds: 600 }));
   assert.strictEqual(decision, null);
 }
 
@@ -149,7 +149,22 @@ function position(overrides: Partial<Position> = {}): Position {
     NO_CONTEXT,
     filters({ minMcapUsd: 10, maxMcapUsd: 100, minAgeSeconds: 30, maxAgeSeconds: 600, minTargetBuySol: 1, maxTargetBuySol: 5 }),
   );
-  assert.deepStrictEqual(decision, { kind: "sell", positionId: "pos1", reason: "copy_sell" });
+  assert.deepStrictEqual(decision, { kind: "sell", positionId: "pos1", reason: "copy_sell", fraction: 1 });
+}
+
+// 13b. Partial copy-sell: sellFraction from context flows straight into the Decision, so a target
+// selling e.g. 30% of their tracked holdings sells 30% of OUR position, not the whole thing
+{
+  const state: StrategyState = { openPositions: [position()] };
+  const decision = evaluateTrade(trade({ direction: "sell", mint: "MintA111" }), state, { mcapUsd: null, ageSeconds: null, sellFraction: 0.3 }, NO_FILTERS);
+  assert.deepStrictEqual(decision, { kind: "sell", positionId: "pos1", reason: "copy_sell", fraction: 0.3 });
+}
+
+// 13c. Full copy-sell: sellFraction of 1 (target sold their entire tracked position) exits fully
+{
+  const state: StrategyState = { openPositions: [position()] };
+  const decision = evaluateTrade(trade({ direction: "sell", mint: "MintA111" }), state, { mcapUsd: null, ageSeconds: null, sellFraction: 1 }, NO_FILTERS);
+  assert.deepStrictEqual(decision, { kind: "sell", positionId: "pos1", reason: "copy_sell", fraction: 1 });
 }
 
 // 14. Target buy size filter: tiny "chart support" buy below min -> skip

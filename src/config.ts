@@ -46,14 +46,32 @@ function parseLadderTiers(raw: string): LadderTier[] {
 export const config = {
   grpc: {
     publicnode: {
-      endpoint: optional("PUBLICNODE_GRPC_ENDPOINT", "https://solana-yellowstone-grpc.publicnode.com:443"),
+      // No hardcoded default (unlike before) — opt-in only, same as helius/rpcfast below, so it's
+      // easy to run a clean single-source test of one provider without another silently filling in.
+      endpoint: process.env.PUBLICNODE_GRPC_ENDPOINT || undefined,
       token: process.env.PUBLICNODE_GRPC_TOKEN || undefined,
     },
     helius: {
       endpoint: process.env.HELIUS_GRPC_ENDPOINT || undefined,
       token: process.env.HELIUS_API_KEY || undefined,
     },
+    rpcfast: {
+      endpoint: process.env.RPCFAST_GRPC_ENDPOINT || undefined,
+      token: process.env.RPCFAST_GRPC_TOKEN || undefined,
+    },
+    // Raiden Vortex — a Geyser/Yellowstone-compatible gRPC stream (raiden.wtf), so it plugs into
+    // the exact same @triton-one/yellowstone-grpc client as every other source here — no code
+    // changes needed to add or swap to it, just these two env vars.
+    raiden: {
+      endpoint: process.env.RAIDEN_GRPC_ENDPOINT || undefined,
+      token: process.env.RAIDEN_GRPC_TOKEN || undefined,
+    },
   },
+  // Subscribes to ALL pump.fun program activity (not just target wallets) to pre-warm the mcap/age
+  // caches from every token creation, not just ones target wallets happen to cause themselves — see
+  // Ingestion.start(). Meaningfully higher gRPC message volume in exchange for near-instant age
+  // resolution on most live copy-trade decisions; disable if that volume becomes a problem.
+  enableCreatePrewarm: optional("ENABLE_CREATE_PREWARM", "true") === "true",
   rpcHttpUrl: optional("RPC_HTTP_URL", "https://api.mainnet-beta.solana.com"),
   targetWallets: optional("TARGET_WALLETS", "")
     .split(",")
@@ -82,6 +100,18 @@ export const config = {
   },
   apiPort: Number(optional("API_PORT", "4000")),
   botName: optional("BOT_NAME", "Devmancody-CopytraderBot"),
+  live: {
+    // Hard safety rails — enforced in src/executor/live.ts before any transaction is built, on
+    // top of (not instead of) the ordinary POSITION_SIZE_SOL/MAX_CONCURRENT_POSITIONS strategy
+    // config. Defaults deliberately match a tiny real-money test run.
+    maxPositionSol: Number(optional("LIVE_MAX_POSITION_SOL", "0.05")),
+    maxTotalSolAtRisk: Number(optional("LIVE_MAX_TOTAL_SOL_AT_RISK", "0.2")),
+    minSolReserve: Number(optional("LIVE_MIN_SOL_RESERVE", "0.02")), // never spend the wallet down below this (rent + fees)
+    slippageBps: Number(optional("LIVE_SLIPPAGE_BPS", "500")), // 5% — how far below the current-reserves estimate we set the exact-output ask
+    computeUnitLimit: Number(optional("LIVE_COMPUTE_UNIT_LIMIT", "300000")),
+    computeUnitPriceMicroLamports: Number(optional("LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS", "50000")),
+    confirmTimeoutMs: Number(optional("LIVE_CONFIRM_TIMEOUT_MS", "45000")),
+  },
   // Startup defaults for the live-editable entry filters (src/settings.ts). Leave blank/unset
   // for "no limit" — the UI's Save Filters button can still change these at any time; this just
   // means a restart no longer resets them back to unlimited.
@@ -101,17 +131,20 @@ export function assertRunnable() {
   if (config.targetWallets.length === 0) {
     throw new Error("TARGET_WALLETS is empty — set at least one wallet address to copy in .env");
   }
-  if (!config.grpc.helius.endpoint && !config.grpc.publicnode.endpoint) {
-    throw new Error("No gRPC endpoint configured (need PUBLICNODE_GRPC_ENDPOINT and/or HELIUS_GRPC_ENDPOINT)");
+  if (!config.grpc.helius.endpoint && !config.grpc.publicnode.endpoint && !config.grpc.rpcfast.endpoint && !config.grpc.raiden.endpoint) {
+    throw new Error("No gRPC endpoint configured (need at least one of PUBLICNODE_GRPC_ENDPOINT, HELIUS_GRPC_ENDPOINT, RPCFAST_GRPC_ENDPOINT, RAIDEN_GRPC_ENDPOINT)");
   }
   if (config.mode !== "paper" && config.mode !== "live") {
     throw new Error(`MODE must be "paper" or "live", got "${config.mode}"`);
   }
   if (config.mode === "live") {
-    // There is no live executor yet (see App) — fail loudly at startup rather than silently run
-    // paper logic while the UI/logs claim to be live, or crash confusingly deeper in the stack.
-    throw new Error(
-      "MODE=live is not implemented yet — live execution (real swap building, signing, submission) hasn't been built. Set MODE=paper.",
-    );
+    if (!process.env.LIVE_PRIVATE_KEY || process.env.LIVE_PRIVATE_KEY.trim() === "") {
+      throw new Error("MODE=live requires LIVE_PRIVATE_KEY to be set (base58 secret key or JSON array) — see .env.example.");
+    }
+    if (config.positionSizeSol > config.live.maxPositionSol) {
+      throw new Error(
+        `POSITION_SIZE_SOL (${config.positionSizeSol}) exceeds LIVE_MAX_POSITION_SOL (${config.live.maxPositionSol}) — refusing to start MODE=live with a position size above the configured safety cap. Lower POSITION_SIZE_SOL or raise LIVE_MAX_POSITION_SOL if you really mean it.`,
+      );
+    }
   }
 }

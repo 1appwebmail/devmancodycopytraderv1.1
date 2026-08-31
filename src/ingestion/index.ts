@@ -4,12 +4,17 @@ import { config } from "../config.js";
 import { startGrpcSource } from "./grpcSource.js";
 import { decodeTransaction } from "./decodeTransaction.js";
 import { PoolRegistry } from "../pools/registry.js";
-import { WSOL_MINT, LAMPORTS_PER_SOL } from "../constants.js";
+import { WSOL_MINT, LAMPORTS_PER_SOL, PUMP_PROGRAM_ID } from "../constants.js";
 import type { TradeEvent, CreateEvent, MigrationEvent, RawPumpSwapTrade } from "../types.js";
 
 export interface IngestionEvents {
   trade: (evt: TradeEvent) => void;
   create: (evt: CreateEvent) => void;
+  // Fires for EVERY pump.fun mint creation this process observes, regardless of who created it —
+  // unlike "create" (scoped to target-wallet-caused launches, for the UI/business logic), this is
+  // purely a cache-prewarming signal. Only actually fires broadly when the ENABLE_CREATE_PREWARM
+  // subscription is on; without it, this and "create" are equivalent (both target-wallet-scoped).
+  mintSeen: (evt: CreateEvent) => void;
   migration: (evt: MigrationEvent) => void;
   status: (source: string, status: "connected" | "disconnected" | "error", detail?: string) => void;
 }
@@ -39,6 +44,12 @@ export class Ingestion extends EventEmitter {
     if (config.grpc.helius.endpoint) {
       sources.push({ name: "helius", endpoint: config.grpc.helius.endpoint, token: config.grpc.helius.token });
     }
+    if (config.grpc.rpcfast.endpoint) {
+      sources.push({ name: "rpcfast", endpoint: config.grpc.rpcfast.endpoint, token: config.grpc.rpcfast.token });
+    }
+    if (config.grpc.raiden.endpoint) {
+      sources.push({ name: "raiden", endpoint: config.grpc.raiden.endpoint, token: config.grpc.raiden.token });
+    }
     if (sources.length === 0) {
       throw new Error("No gRPC sources configured");
     }
@@ -49,6 +60,30 @@ export class Ingestion extends EventEmitter {
         endpoint: src.endpoint,
         token: src.token,
         targetWallets: config.targetWallets,
+        onTransaction: (info, slot) => this.handleTransaction(info, slot),
+        onStatus: (source, status, detail) => this.emit("status", source, status, detail),
+      });
+    }
+
+    // Broad, platform-wide subscription to ALL pump.fun program activity (not just target
+    // wallets) — the only thing this is actually for is CreateEvents: App.ts's "create" handler
+    // already pre-warms MintInfoCache/TokenAgeCache from any create it sees, but until now that
+    // only fired when a target wallet itself created the token. Most tokens target wallets buy
+    // were created by someone else, so the age lookup was a cold, ~0.5-1s RPC round trip on nearly
+    // every live copy-trade decision (verified via [timing] log instrumentation). This makes that
+    // free almost all the time instead, at the cost of much higher gRPC message volume (every
+    // pump.fun trade platform-wide also arrives here, not just creates) — non-target-wallet trades
+    // are silently dropped by the same targetWalletSet filter handleTransaction already has, and
+    // markSeen's dedup means a target wallet's own trade arriving on both this feed and the normal
+    // one above is harmless, not double-counted. Can be disabled via ENABLE_CREATE_PREWARM=false
+    // if the extra load turns out to be a problem.
+    if (config.enableCreatePrewarm && sources[0]) {
+      const primary = sources[0];
+      startGrpcSource({
+        name: `${primary.name}-prewarm`,
+        endpoint: primary.endpoint,
+        token: primary.token,
+        targetWallets: [PUMP_PROGRAM_ID],
         onTransaction: (info, slot) => this.handleTransaction(info, slot),
         onStatus: (source, status, detail) => this.emit("status", source, status, detail),
       });
@@ -66,6 +101,19 @@ export class Ingestion extends EventEmitter {
   }
 
   private async handleTransaction(info: Parameters<typeof decodeTransaction>[0], slot: number) {
+    // Not awaited by its caller (startGrpcSource's onTransaction) — any uncaught throw anywhere in
+    // here becomes an unhandled promise rejection rather than a normal error, which found a real
+    // bug live (see decodeTransaction.ts's per-instruction try/catch) and could just as easily
+    // happen somewhere else in this function later. One bad transaction must never risk silently
+    // stopping trade detection for the rest of the session.
+    try {
+      await this.handleTransactionInner(info, slot);
+    } catch (err) {
+      console.error("Ingestion: failed to handle a transaction, skipping it:", err);
+    }
+  }
+
+  private async handleTransactionInner(info: Parameters<typeof decodeTransaction>[0], slot: number) {
     const decoded = decodeTransaction(info, slot);
     if (
       decoded.trades.length === 0 &&
@@ -93,7 +141,8 @@ export class Ingestion extends EventEmitter {
       if (trade) this.emit("trade", trade);
     }
     for (const create of decoded.creates) {
-      this.emit("create", create);
+      this.emit("mintSeen", create); // cache prewarming — every create, regardless of creator
+      if (this.targetWalletSet.has(create.creator)) this.emit("create", create); // UI/business logic — target-wallet launches only
     }
     for (const migration of decoded.migrations) {
       this.emit("migration", migration);

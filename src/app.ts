@@ -2,8 +2,11 @@ import { Connection } from "@solana/web3.js";
 import { EventEmitter } from "node:events";
 import { config } from "./config.js";
 import { Ingestion } from "./ingestion/index.js";
-import { evaluateTrade, type StrategyState, type TradeContext } from "./strategy.js";
+import { evaluateTrade, explainBuySkip, type StrategyState, type TradeContext } from "./strategy.js";
 import { PaperExecutor, type Reserves } from "./executor/paper.js";
+import { LiveExecutor } from "./executor/live.js";
+import { loadLiveKeypair } from "./live/keys.js";
+import type { Executor } from "./executor/types.js";
 import { PositionMonitor } from "./positionManager.js";
 import { getPumpswapReserves, getReservesForPosition } from "./pricing/liveReserves.js";
 import { MintInfoCache } from "./pricing/mintInfo.js";
@@ -15,27 +18,56 @@ import { LAMPORTS_PER_SOL } from "./constants.js";
 import { appendTradeLog } from "./reporting/tradeLog.js";
 import { sendTelegramMessage } from "./reporting/telegram.js";
 import { buildCopyBuyNotification, buildCopySellNotification, buildAutonomousExitNotification } from "./reporting/notifications.js";
-import { getSettings, isFilteringByMcap, isFilteringByAge } from "./settings.js";
+import { getSettings, getEffectiveSettings, isFilteringByMcap, isFilteringByAge } from "./settings.js";
 import { loadState, persistState } from "./reporting/statePersistence.js";
+import { TargetHoldingsTracker } from "./pricing/targetHoldings.js";
 import type { TradeEvent, CreateEvent, MigrationEvent, Position, TradeLogEntry } from "./types.js";
+
+// Human-readable text for every reason explainBuySkip can return — keeps the [skip] log line
+// meaningful instead of always dumping mcap/age context that isn't necessarily the real reason
+// (e.g. a target's small top-up buy skipped by MIN_TARGET_BUY_SOL, not mcap/age at all).
+const BUY_SKIP_MESSAGES: Record<string, string> = {
+  already_open: "already holding a position in this mint",
+  max_concurrent_positions: "at MAX_CONCURRENT_POSITIONS limit",
+  target_buy_too_small: "target's buy was below MIN_TARGET_BUY_SOL",
+  target_buy_too_large: "target's buy was above MAX_TARGET_BUY_SOL",
+  mcap_unresolved: "mcap filter active but mcap couldn't be resolved",
+  mcap_too_low: "mcap below MIN_MCAP_USD",
+  mcap_too_high: "mcap above MAX_MCAP_USD",
+  age_unresolved: "age filter active but age couldn't be resolved",
+  age_too_young: "token younger than MIN_AGE_SECONDS",
+  age_too_old: "token older than MAX_AGE_SECONDS",
+  unknown: "passed all checks — this shouldn't happen, evaluateTrade and explainBuySkip may have drifted out of sync",
+};
 
 export class App extends EventEmitter {
   readonly connection: Connection;
   readonly ingestion: Ingestion;
-  readonly executor: PaperExecutor;
+  readonly executor: Executor;
   readonly positionMonitor: PositionMonitor;
   readonly mintInfo: MintInfoCache;
   readonly tokenAge: TokenAgeCache;
   readonly tokenMetadata: TokenMetadataCache;
   // Closes the multi-target-wallet duplicate-buy race — see handleTargetTrade.
   private readonly pendingBuyMints = new Set<string>();
+  // Tracks each target wallet's observed holdings per mint, purely from trade events this bot has
+  // seen — lets a copy-sell mirror the fraction the target actually sold instead of always fully
+  // exiting the position regardless of how much of their own position they sold. See
+  // pricing/targetHoldings.ts.
+  private readonly targetHoldings = new TargetHoldingsTracker();
 
   constructor() {
     super();
     this.connection = new Connection(config.rpcHttpUrl, "confirmed");
     this.ingestion = new Ingestion(this.connection);
     const restored = loadState();
-    this.executor = new PaperExecutor(config.startingPaperBalanceSol, restored ?? undefined);
+    if (config.mode === "live") {
+      const keypair = loadLiveKeypair();
+      console.log(`[live] trading wallet: ${keypair.publicKey.toBase58()}`);
+      this.executor = new LiveExecutor(this.connection, keypair, restored ?? undefined);
+    } else {
+      this.executor = new PaperExecutor(config.startingPaperBalanceSol, restored ?? undefined);
+    }
     if (restored) {
       console.log(`Restored ${config.mode} state: balance=${restored.balanceSol.toFixed(4)} SOL, ${restored.positions.filter((p) => p.status === "open").length} open position(s)`);
     }
@@ -46,13 +78,18 @@ export class App extends EventEmitter {
 
     this.ingestion.on("status", (source, status, detail) => this.emit("status", source, status, detail));
     this.ingestion.on("trade", (evt) => void this.handleTargetTrade(evt));
-    this.ingestion.on("create", (evt) => {
-      // Pre-warm: avoids an RPC round trip on the first copy trade for this mint.
+    // Pre-warms mcap/age/symbol caches for EVERY mint this process observes being created,
+    // regardless of who created it — see Ingestion's ENABLE_CREATE_PREWARM subscription. Avoids an
+    // RPC round trip on a target wallet's first copy trade for a mint someone else launched, which
+    // was otherwise the dominant cost in a live copy-trade decision (verified via [timing] logs).
+    this.ingestion.on("mintSeen", (evt) => {
       this.mintInfo.set(evt.mint, evt.totalSupplyRaw);
       this.tokenAge.set(evt.mint, evt.timestamp);
       this.tokenMetadata.set(evt.mint, evt.symbol);
-      this.emit("create", evt);
     });
+    // UI/business-logic signal — scoped to target-wallet-caused launches only (unlike mintSeen
+    // above), so the UI's create feed doesn't flood with every pump.fun token platform-wide.
+    this.ingestion.on("create", (evt) => this.emit("create", evt));
     this.ingestion.on("migration", (evt) => this.emit("migration", evt));
 
     this.positionMonitor.on("exit", (position, entry, reason) => this.handleExit(position, entry, reason));
@@ -63,6 +100,7 @@ export class App extends EventEmitter {
     this.ingestion.start();
     this.positionMonitor.start();
     startSolUsdPoller();
+    void this.executor.refreshBalance();
   }
 
   /** Manually close a position at the current market price (frontend "Close" button). */
@@ -73,7 +111,7 @@ export class App extends EventEmitter {
     const reserves = await getReservesForPosition(this.connection, position, this.ingestion.getPoolRegistry());
     if (!reserves) return null;
 
-    const entry = this.executor.sell(position.id, reserves, "manual", 1);
+    const entry = await this.executor.sell(position.id, reserves, "manual", 1);
     if (entry) await this.handleExit(position, entry, "manual");
     return entry;
   }
@@ -91,18 +129,27 @@ export class App extends EventEmitter {
   private async handleTargetTrade(event: TradeEvent) {
     this.emit("trade", event);
 
+    // Update the target's tracked holdings for EVERY trade we see, regardless of whether our own
+    // filters end up copying it — this models the target's REAL holdings, not just the subset of
+    // their trades we acted on, so a later partial sell computes an accurate fraction. Must happen
+    // before the sellFraction computation in handleSellCandidate uses it.
+    if (event.direction === "buy") {
+      this.targetHoldings.recordBuy(event.trader, event.mint, event.tokenAmount);
+    }
+
     // Closes the multi-wallet race: handleTargetTrade isn't awaited by its caller, so if two
     // target wallets buy the same mint within milliseconds of each other, both calls can read
     // "no open position yet" before either buy has actually landed, and both would copy it. This
     // lock is set synchronously — before any `await` — so the second event bails out immediately
     // instead of racing the first through the (much slower) filter/reserve-lookup/execute path.
+    const receivedAt = Date.now();
     if (event.direction === "buy") {
       if (this.pendingBuyMints.has(event.mint)) return;
       const alreadyOpen = this.executor.getState().positions.some((p) => p.mint === event.mint && p.status === "open");
       if (alreadyOpen) return;
       this.pendingBuyMints.add(event.mint);
       try {
-        await this.handleBuyCandidate(event);
+        await this.handleBuyCandidate(event, receivedAt);
       } finally {
         this.pendingBuyMints.delete(event.mint);
       }
@@ -111,27 +158,44 @@ export class App extends EventEmitter {
     }
   }
 
-  private async handleBuyCandidate(event: TradeEvent) {
+  private async handleBuyCandidate(event: TradeEvent, receivedAt: number) {
     const state: StrategyState = { openPositions: this.executor.getState().positions };
-    const settings = getSettings();
+    // Each target wallet's OWN filter overrides if they have one (see settings.ts) — different
+    // wallets genuinely trade at different mcap/age ranges, so a single global filter tuned for
+    // one wallet silently drops another's legitimate signals entirely.
+    const settings = getEffectiveSettings(event.trader);
     const context = await this.resolveTradeContext(event, settings);
     const decision = evaluateTrade(event, state, context, settings);
     if (!decision) {
-      if (isFilteringByMcap() || isFilteringByAge()) {
-        console.log(
-          `[filter] skipped ${event.mint.slice(0, 8)}… buy (${event.solAmount.toFixed(4)} SOL from ${event.trader.slice(0, 8)}…): ` +
-            `mcapUsd=${context.mcapUsd ?? "unresolved"} ageSeconds=${context.ageSeconds ?? "unresolved"} ` +
-            `bounds={minMcapUsd=${settings.minMcapUsd},maxMcapUsd=${settings.maxMcapUsd},minAgeSeconds=${settings.minAgeSeconds},maxAgeSeconds=${settings.maxAgeSeconds}}`,
-        );
-      }
+      const reason = explainBuySkip(event, state, context, settings);
+      console.log(
+        `[skip] ${event.mint.slice(0, 8)}… buy (${event.solAmount.toFixed(4)} SOL from ${event.trader.slice(0, 8)}…): ${BUY_SKIP_MESSAGES[reason ?? "unknown"] ?? reason} ` +
+          `[mcapUsd=${context.mcapUsd?.toFixed(0) ?? "unresolved"} ageSeconds=${context.ageSeconds ?? "unresolved"} ` +
+          `minTargetBuySol=${settings.minTargetBuySol} maxTargetBuySol=${settings.maxTargetBuySol} ` +
+          `minMcapUsd=${settings.minMcapUsd} maxMcapUsd=${settings.maxMcapUsd} minAgeSeconds=${settings.minAgeSeconds} maxAgeSeconds=${settings.maxAgeSeconds}]`,
+      );
       return;
     }
     if (decision.kind !== "buy") return; // shouldn't happen — evaluateTrade(buy event) only ever returns a buy Decision or null
 
+    const filtersResolvedAt = Date.now();
     const reserves = await this.resolveFillReserves(event);
     if (!reserves) return; // couldn't get accurate pricing (e.g. pool RPC lookup failed) — skip rather than fill at a wrong price
+    const reservesResolvedAt = Date.now();
 
-    const position = this.executor.buy(decision.mint, decision.venue, decision.solAmount, reserves, decision.pool);
+    const position = await this.executor.buy(decision.mint, decision.venue, decision.solAmount, reserves, decision.pool);
+    const buyDoneAt = Date.now();
+
+    // Breaks down where the total target-trade-to-our-fill latency actually goes, so a bad fill
+    // price can be diagnosed as "our own pipeline was slow" (detection/filters/reserves — Beam
+    // tips/providers can't fix this) vs. "submission/confirmation was slow" (Beam/priority-fee
+    // territory) instead of guessing. eventAtMs is the target's own on-chain blockTime — detectionMs
+    // includes gRPC delivery lag, which can itself be a meaningful chunk of the total.
+    const eventAtMs = event.timestamp * 1000;
+    console.log(
+      `[timing] ${event.mint.slice(0, 8)}… buy: detection=${receivedAt - eventAtMs}ms filters=${filtersResolvedAt - receivedAt}ms reserves=${reservesResolvedAt - filtersResolvedAt}ms submit+confirm=${buyDoneAt - reservesResolvedAt}ms total=${buyDoneAt - eventAtMs}ms`,
+    );
+
     if (position) {
       position.targetWallet = event.trader;
       this.emit("buy", position);
@@ -148,7 +212,12 @@ export class App extends EventEmitter {
 
   private async handleSellCandidate(event: TradeEvent) {
     const state: StrategyState = { openPositions: this.executor.getState().positions };
-    const decision = evaluateTrade(event, state, { mcapUsd: null, ageSeconds: null }, getSettings());
+    // Fraction of the target's OWN tracked holdings this sell represents — computed once here
+    // (recordSell also mutates their tracked balance down, so it must only be called once per
+    // sell event) and threaded through evaluateTrade so a partial sell copies proportionally
+    // instead of always fully exiting our position. See pricing/targetHoldings.ts.
+    const sellFraction = this.targetHoldings.recordSell(event.trader, event.mint, event.tokenAmount);
+    const decision = evaluateTrade(event, state, { mcapUsd: null, ageSeconds: null, sellFraction }, getSettings());
     if (!decision || decision.kind !== "sell") return;
 
     const heldPosition = state.openPositions.find((p) => p.id === decision.positionId);
@@ -160,7 +229,8 @@ export class App extends EventEmitter {
     const reserves = await this.resolveFillReserves(event);
     if (!reserves) return;
 
-    const entry = this.executor.sell(decision.positionId, reserves, "copy_sell", 1);
+    console.log(`[copy_sell] ${event.mint.slice(0, 8)}… selling ${(decision.fraction * 100).toFixed(1)}% of position (target sold ${(sellFraction * 100).toFixed(1)}% of their tracked holdings)`);
+    const entry = await this.executor.sell(decision.positionId, reserves, "copy_sell", decision.fraction);
     if (entry) {
       void this.enrichAndLogCopy(entry, event);
       void this.handleExit(
@@ -194,11 +264,14 @@ export class App extends EventEmitter {
    * per-mint after the first hit, so this only adds latency on a mint we've never seen before.
    */
   private async resolveTradeContext(event: TradeEvent, settings: ReturnType<typeof getSettings>): Promise<TradeContext> {
-    if (event.direction !== "buy") return { mcapUsd: null, ageSeconds: null };
+    if (event.direction !== "buy") return { mcapUsd: null, ageSeconds: null, sellFraction: null };
 
-    const needMcap = isFilteringByMcap();
-    const needAge = isFilteringByAge();
-    if (!needMcap && !needAge) return { mcapUsd: null, ageSeconds: null };
+    // Checked against THIS event's effective (possibly per-wallet) settings, not the global
+    // default — a wallet-specific override that adds an mcap/age bound the global doesn't have
+    // (or vice versa) must still correctly trigger/skip the RPC lookup below.
+    const needMcap = isFilteringByMcap(settings);
+    const needAge = isFilteringByAge(settings);
+    if (!needMcap && !needAge) return { mcapUsd: null, ageSeconds: null, sellFraction: null };
 
     const [totalSupplyRaw, createdAt] = await Promise.all([
       needMcap ? this.mintInfo.resolveTotalSupply(event.mint) : Promise.resolve(null),
@@ -217,7 +290,7 @@ export class App extends EventEmitter {
     const rawAgeSeconds = needAge && createdAt !== null ? event.timestamp - createdAt : null;
     const ageSeconds = rawAgeSeconds !== null && rawAgeSeconds >= 0 ? rawAgeSeconds : null;
 
-    return { mcapUsd, ageSeconds };
+    return { mcapUsd, ageSeconds, sellFraction: null };
   }
 
   /**

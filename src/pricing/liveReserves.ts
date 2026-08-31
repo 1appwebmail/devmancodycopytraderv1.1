@@ -1,4 +1,5 @@
 import { Connection, PublicKey } from "@solana/web3.js";
+import { canonicalPumpPoolPda } from "@pump-fun/pump-swap-sdk";
 import { decodeStruct } from "../parsing/borsh.js";
 import { BondingCurveAccountSchema } from "../parsing/schemas.js";
 import { PUMP_PROGRAM_ID, PUMP_AMM_PROGRAM_ID, WSOL_MINT } from "../constants.js";
@@ -52,10 +53,28 @@ export async function getPumpfunReserves(connection: Connection, mint: string): 
   return curve.reserves;
 }
 
-/** Finds the PumpSwap pool for a mint that's graduated off the bonding curve — there's no
- *  deterministic address to derive (pool index/creator aren't fixed), so this scans PumpSwap's
- *  Pool accounts for one with base_mint === mint. Verified against a real migrated mint. */
+/**
+ * Finds the PumpSwap pool for a mint that's graduated off the bonding curve. A standard pump.fun
+ * migration always creates its pool at a deterministic PDA (index 0, quote=WSOL) — verified
+ * against a real migrated mint (canonicalPumpPoolPda's derivation matched the real pool exactly).
+ * This needs only getAccountInfo, unlike the getProgramAccounts scan this replaced, which many RPC
+ * providers (rpcfast included, on some plans) reject outright with "Method not available".
+ *
+ * Falls back to a getProgramAccounts scan only if the canonical PDA doesn't exist — covers the
+ * rare non-canonical case (a manually created competing pool) without depending on it for the
+ * common path. Failures here are silent (not logged) since providers that reject the scan would
+ * otherwise spam an error on every single migrated-position poll tick.
+ */
 export async function findPumpSwapPoolForMint(connection: Connection, mint: string): Promise<string | null> {
+  const mintPk = new PublicKey(mint);
+  const canonical = canonicalPumpPoolPda(mintPk);
+  try {
+    const info = await withRetry(() => connection.getAccountInfo(canonical));
+    if (info) return canonical.toBase58();
+  } catch (err) {
+    console.error(`findPumpSwapPoolForMint: canonical PDA lookup failed for mint ${mint}:`, err);
+  }
+
   try {
     const accounts = await withRetry(() =>
       connection.getProgramAccounts(new PublicKey(PUMP_AMM_PROGRAM_ID), {
@@ -63,8 +82,7 @@ export async function findPumpSwapPoolForMint(connection: Connection, mint: stri
       }),
     );
     return accounts[0]?.pubkey.toBase58() ?? null;
-  } catch (err) {
-    console.error(`findPumpSwapPoolForMint: failed for mint ${mint}:`, err);
+  } catch {
     return null;
   }
 }

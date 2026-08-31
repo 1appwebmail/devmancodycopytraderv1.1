@@ -5,8 +5,9 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import { App } from "../app.js";
 import { config } from "../config.js";
-import { getSettings, updateSettings } from "../settings.js";
+import { getSettings, updateSettings, getAllWalletSettings, setWalletSettings, clearWalletSettings, type FilterSettings } from "../settings.js";
 import { getSolUsdPrice } from "../pricing/solUsd.js";
+import { getAllWalletNames, setWalletName } from "../pricing/walletNames.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.resolve(__dirname, "../../public");
@@ -27,10 +28,45 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return raw ? JSON.parse(raw) : {};
 }
 
+const FILTER_KEYS = ["minMcapUsd", "maxMcapUsd", "minAgeSeconds", "maxAgeSeconds", "minTargetBuySol", "maxTargetBuySol"] as const;
+
+/** Validates a request body's filter fields, returning only the keys actually present (so a
+ *  partial patch and a full replacement can share the same validation). Returns an error string
+ *  instead of throwing so callers can respond with a proper 400. */
+function parseFilterFields(body: unknown): { patch: Record<string, number | null> } | { error: string } {
+  if (typeof body !== "object" || body === null) return { error: "expected a JSON object" };
+  const patch: Record<string, number | null> = {};
+  for (const key of FILTER_KEYS) {
+    if (key in body) {
+      const value = (body as Record<string, unknown>)[key];
+      if (value !== null && typeof value !== "number") return { error: `${key} must be a number or null` };
+      patch[key] = value as number | null;
+    }
+  }
+  return { patch };
+}
+
+/** Single source of truth for the "full state" payload — used by both GET /api/state and the
+ *  WebSocket's initial push on connect. These used to be built separately and had drifted out of
+ *  sync (the WS version was missing targetWallets/mode/startingBalanceSol); since the client's WS
+ *  handler REPLACES its whole local state object with whichever of these arrives, any field
+ *  present in one but not the other would vanish depending on which happened to land last. */
+function buildFullStatePayload(app: App) {
+  return {
+    ...app.executor.getState(),
+    startingBalanceSol: config.startingPaperBalanceSol,
+    mode: config.mode,
+    targetWallets: config.targetWallets,
+    solUsdPrice: getSolUsdPrice(),
+    symbols: app.tokenMetadata.getAll(),
+    botName: config.botName,
+  };
+}
+
 export function startApiServer(app: App) {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") {
       res.writeHead(204);
@@ -47,16 +83,7 @@ export function startApiServer(app: App) {
       }
 
       if (req.method === "GET" && req.url === "/api/state") {
-        const state = app.executor.getState();
-        respondJson(res, 200, {
-          ...state,
-          startingBalanceSol: config.startingPaperBalanceSol,
-          mode: config.mode,
-          targetWallets: config.targetWallets,
-          solUsdPrice: getSolUsdPrice(),
-          symbols: app.tokenMetadata.getAll(),
-          botName: config.botName,
-        });
+        respondJson(res, 200, buildFullStatePayload(app));
         return;
       }
 
@@ -66,26 +93,72 @@ export function startApiServer(app: App) {
       }
 
       if (req.method === "POST" && req.url === "/api/settings") {
-        const body = await readJsonBody(req);
-        if (typeof body !== "object" || body === null) {
-          respondJson(res, 400, { error: "expected a JSON object" });
+        const parsed = parseFilterFields(await readJsonBody(req));
+        if ("error" in parsed) {
+          respondJson(res, 400, { error: parsed.error });
           return;
         }
-        const allowedKeys = ["minMcapUsd", "maxMcapUsd", "minAgeSeconds", "maxAgeSeconds", "minTargetBuySol", "maxTargetBuySol"] as const;
-        const patch: Record<string, number | null> = {};
-        for (const key of allowedKeys) {
-          if (key in body) {
-            const value = (body as Record<string, unknown>)[key];
-            if (value !== null && typeof value !== "number") {
-              respondJson(res, 400, { error: `${key} must be a number or null` });
-              return;
-            }
-            patch[key] = value as number | null;
-          }
-        }
-        const updated = updateSettings(patch);
+        const updated = updateSettings(parsed.patch);
         broadcast("settings", updated);
         respondJson(res, 200, updated);
+        return;
+      }
+
+      // Per-target-wallet filter overrides — a wallet with an entry here uses ITS OWN complete
+      // filter set instead of the global one above (see settings.ts). GET returns all overrides
+      // keyed by wallet address; POST sets/replaces one wallet's full filter set (unlike the
+      // global PATCH-style endpoint above, this expects all six fields — the UI always sends a
+      // complete set for a wallet, defaulting unfilled fields to the global values as a starting
+      // point); DELETE removes the override, reverting that wallet to the global defaults.
+      if (req.method === "GET" && req.url === "/api/settings/wallets") {
+        respondJson(res, 200, getAllWalletSettings());
+        return;
+      }
+
+      const walletSettingsMatch = req.url?.match(/^\/api\/settings\/wallets\/([^/]+)$/);
+      if (walletSettingsMatch) {
+        const wallet = decodeURIComponent(walletSettingsMatch[1]);
+        if (req.method === "POST") {
+          const parsed = parseFilterFields(await readJsonBody(req));
+          if ("error" in parsed) {
+            respondJson(res, 400, { error: parsed.error });
+            return;
+          }
+          const merged: FilterSettings = { ...getSettings(), ...parsed.patch };
+          const updated = setWalletSettings(wallet, merged);
+          broadcast("walletSettings", { wallet, settings: updated });
+          respondJson(res, 200, updated);
+          return;
+        }
+        if (req.method === "DELETE") {
+          clearWalletSettings(wallet);
+          broadcast("walletSettings", { wallet, settings: null });
+          respondJson(res, 200, { cleared: true });
+          return;
+        }
+      }
+
+      // Wallet nicknames — pure display labels, never used for matching/filtering (TARGET_WALLETS
+      // addresses are still the real source of truth). GET returns all; POST sets/clears one (an
+      // empty/blank name clears it, same convention as the filter inputs elsewhere in this UI).
+      if (req.method === "GET" && req.url === "/api/wallet-names") {
+        respondJson(res, 200, getAllWalletNames());
+        return;
+      }
+
+      const walletNameMatch = req.method === "POST" && req.url?.match(/^\/api\/wallet-names\/([^/]+)$/);
+      if (walletNameMatch) {
+        const wallet = decodeURIComponent(walletNameMatch[1]);
+        const body = await readJsonBody(req);
+        const name = (body as Record<string, unknown>)?.name;
+        if (typeof name !== "string") {
+          respondJson(res, 400, { error: "expected { name: string }" });
+          return;
+        }
+        setWalletName(wallet, name);
+        const updated = getAllWalletNames();
+        broadcast("walletNamesAll", updated);
+        respondJson(res, 200, { wallet, name: updated[wallet] ?? null });
         return;
       }
 
@@ -144,8 +217,10 @@ export function startApiServer(app: App) {
   app.on("symbol", (payload) => broadcast("symbol", payload));
 
   wss.on("connection", (ws) => {
-    ws.send(JSON.stringify({ type: "state", payload: { ...app.executor.getState(), solUsdPrice: getSolUsdPrice(), symbols: app.tokenMetadata.getAll(), botName: config.botName } }, bigintSafeReplacer));
+    ws.send(JSON.stringify({ type: "state", payload: buildFullStatePayload(app) }, bigintSafeReplacer));
     ws.send(JSON.stringify({ type: "settings", payload: getSettings() }, bigintSafeReplacer));
+    ws.send(JSON.stringify({ type: "walletSettingsAll", payload: getAllWalletSettings() }, bigintSafeReplacer));
+    ws.send(JSON.stringify({ type: "walletNamesAll", payload: getAllWalletNames() }, bigintSafeReplacer));
   });
 
   server.listen(config.apiPort, () => {

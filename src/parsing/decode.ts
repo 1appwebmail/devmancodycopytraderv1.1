@@ -32,8 +32,16 @@ function decodeEmitCpiEvent(
   const disc = data.subarray(8, 16);
   for (const [name, expected] of Object.entries(discriminators)) {
     if (disc.equals(expected)) {
+      // A recognized discriminator with no registered schema (e.g. CompletePumpAmmMigrationEvent
+      // — its discriminator is tracked for recognition, but nothing decodes/uses its fields; see
+      // decodeTransaction.ts, which builds MigrationEvent from CompleteEvent instead) is treated
+      // the same as an unrecognized one — skip rather than crash decodeStruct with an undefined
+      // schema. Surfaced by the create-prewarm subscription seeing far more transaction variety
+      // than the target-wallet-only feed ever had.
+      const schema = schemas[name];
+      if (!schema) return null;
       const payload = data.subarray(16);
-      return { name, data: decodeStruct(payload, schemas[name]) };
+      return { name, data: decodeStruct(payload, schema) };
     }
   }
   return null;

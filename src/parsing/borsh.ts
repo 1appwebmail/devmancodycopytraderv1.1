@@ -50,13 +50,19 @@ export class BorshReader {
     for (let i = 0; i < len; i++) out.push(readOne());
     return out;
   }
+  /** Fixed-size Rust array (no length prefix — the count is baked into the struct definition). */
+  array<T>(count: number, readOne: () => T): T[] {
+    const out: T[] = [];
+    for (let i = 0; i < count; i++) out.push(readOne());
+    return out;
+  }
   remaining(): number {
     return this.buf.length - this.offset;
   }
 }
 
 export type FieldType =
-  | "u8" | "u16" | "u32" | "u64" | "i64" | "i128" | "bool" | "pubkey" | "string" | "shareholderVec";
+  | "u8" | "u16" | "u32" | "u64" | "i64" | "i128" | "bool" | "pubkey" | "string" | "shareholderVec" | "pubkeyArray7" | "pubkeyArray8";
 
 export type Schema = readonly (readonly [string, FieldType])[];
 
@@ -76,6 +82,10 @@ function readField(r: BorshReader, type: FieldType): unknown {
     case "string": return r.string();
     case "shareholderVec":
       return r.vec(() => ({ address: r.pubkey(), share_bps: r.u16() }));
+    case "pubkeyArray7":
+      return r.array(7, () => r.pubkey());
+    case "pubkeyArray8":
+      return r.array(8, () => r.pubkey());
   }
 }
 

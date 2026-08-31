@@ -78,6 +78,37 @@
   }
   button.save-btn:hover { background: #164a2e; }
   #filtersStatus { font-size: 11px; color: var(--muted); align-self: center; }
+  .wallet-filters {
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .wallet-filters > summary { cursor: pointer; color: var(--muted); font-size: 11px; text-transform: uppercase; user-select: none; }
+  .wallet-filter-row { border-top: 1px solid var(--border); padding: 8px 0; }
+  .wallet-filter-row:first-of-type { border-top: none; padding-top: 10px; }
+  .wallet-filter-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .wallet-filter-head .addr { font-size: 12px; color: var(--muted); }
+  .wallet-name-input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 12px;
+    width: 140px;
+  }
+  .wallet-name-input:focus { outline: 1px solid var(--accent); }
+  .wallet-badge { font-size: 10px; padding: 1px 7px; border-radius: 8px; }
+  .wallet-badge.custom { background: #1a2f4a; color: var(--accent); }
+  .wallet-badge.global { background: #21262d; color: var(--muted); }
+  .wallet-toggle-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 3px 9px; cursor: pointer; font-family: inherit; font-size: 11px; }
+  .wallet-toggle-btn:hover { color: var(--text); }
+  .wallet-filter-body { display: none; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-top: 8px; padding-left: 4px; }
+  .wallet-filter-body.open { display: flex; }
+  .wallet-reset-btn { background: #2a1616; color: var(--red); border: 1px solid #4a2323; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 12px; height: 28px; }
+  .wallet-reset-btn:hover { background: #3a1e1e; }
+  .wallet-filter-status { font-size: 11px; color: var(--muted); align-self: center; }
   section {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -210,6 +241,11 @@
   <span id="filtersStatus"></span>
 </div>
 
+<details class="wallet-filters">
+  <summary>Per-Wallet Filters — override the global filters above for individual target wallets</summary>
+  <div id="walletFiltersList"></div>
+</details>
+
 <main>
   <section class="positions-section">
     <h2>Open Positions</h2>
@@ -251,6 +287,10 @@ function shorten(addr) { return addr ? addr.slice(0, 6) + "…" + addr.slice(-4)
 function mintLabel(mint) {
   const symbol = state.symbols && state.symbols[mint];
   return symbol ? `${shorten(mint)} (${symbol})` : shorten(mint);
+}
+function walletLabel(addr) {
+  const name = walletNamesMap[addr];
+  return name ? `${name} (${shorten(addr)})` : shorten(addr);
 }
 function fmtUsdCompact(usd) {
   if (usd >= 1_000_000) return "$" + (usd / 1_000_000).toFixed(2) + "M";
@@ -426,7 +466,7 @@ function addCopyLogEntry(c) {
       </span>
       <span class="time">${new Date(c.timestamp * 1000).toLocaleTimeString()}</span>
     </div>
-    <div class="row"><span class="label">Target (${shorten(c.targetWallet)})</span><span>${c.targetSolAmount.toFixed(4)} SOL @ mcap ${fmtMcap(c.targetMcapSol, c.targetMcapUsd)}</span></div>
+    <div class="row"><span class="label">Target (${walletLabel(c.targetWallet)})</span><span>${c.targetSolAmount.toFixed(4)} SOL @ mcap ${fmtMcap(c.targetMcapSol, c.targetMcapUsd)}</span></div>
     <div class="row"><span class="label">Bot copied</span><span>${c.botSolAmount.toFixed(4)} SOL @ mcap ${fmtMcap(c.botMcapSol, c.botMcapUsd)} ${deltaHtml}</span></div>
   `;
   log.prepend(div);
@@ -435,6 +475,7 @@ function addCopyLogEntry(c) {
 }
 
 function applySettingsToInputs(s) {
+  globalSettingsCache = s;
   document.getElementById("minMcap").value = s.minMcapUsd ?? "";
   document.getElementById("maxMcap").value = s.maxMcapUsd ?? "";
   document.getElementById("minAge").value = s.minAgeSeconds ?? "";
@@ -482,6 +523,156 @@ async function loadState() {
   const res = await fetch(`${API_BASE}/api/state`);
   state = await res.json();
   render();
+  renderWalletFilters(); // targetWallets only became known just now
+}
+
+// --- Per-wallet filter overrides ---
+let walletSettingsMap = {}; // wallet -> FilterSettings | absent (absent = using global)
+let walletNamesMap = {}; // wallet -> nickname | absent (absent = no nickname set)
+let globalSettingsCache = {}; // last-loaded global settings, used as the starting point when a wallet has no override yet
+const expandedWallets = new Set(); // preserved across re-renders so editing isn't interrupted by a WS update
+
+async function loadWalletNames() {
+  const res = await fetch(`${API_BASE}/api/wallet-names`);
+  walletNamesMap = await res.json();
+  renderWalletFilters();
+  render(); // positions/etc. may already be rendered with stale labels — refresh them too
+}
+
+async function saveWalletName(wallet, name) {
+  try {
+    await fetch(`${API_BASE}/api/wallet-names/${encodeURIComponent(wallet)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+  } catch {
+    // best-effort — a WS walletNamesAll broadcast (or the next reload) will reconcile either way
+  }
+}
+
+const WALLET_FILTER_FIELDS = [
+  ["minMcapUsd", "Min Mcap (USD)"],
+  ["maxMcapUsd", "Max Mcap (USD)"],
+  ["minAgeSeconds", "Min Age (s)"],
+  ["maxAgeSeconds", "Max Age (s)"],
+  ["minTargetBuySol", "Min Target Buy (SOL)"],
+  ["maxTargetBuySol", "Max Target Buy (SOL)"],
+];
+
+async function loadWalletSettings() {
+  const res = await fetch(`${API_BASE}/api/settings/wallets`);
+  walletSettingsMap = await res.json();
+  renderWalletFilters();
+}
+
+function renderWalletFilters() {
+  const container = document.getElementById("walletFiltersList");
+  const wallets = state?.targetWallets;
+  if (!wallets || wallets.length === 0) {
+    container.innerHTML = `<div class="wallet-filter-row" style="border-top:none;color:var(--muted)">No target wallets configured.</div>`;
+    return;
+  }
+
+  container.innerHTML = wallets
+    .map((wallet) => {
+      const override = walletSettingsMap[wallet];
+      const effective = override ?? globalSettingsCache;
+      const isOpen = expandedWallets.has(wallet);
+      const fieldsHtml = WALLET_FILTER_FIELDS.map(
+        ([key, label]) => `
+        <div class="filter-field">
+          <label>${label}</label>
+          <input type="number" step="any" placeholder="none" data-field="${key}" value="${effective?.[key] ?? ""}" />
+        </div>`,
+      ).join("");
+      const nameValue = (walletNamesMap[wallet] ?? "").replace(/"/g, "&quot;");
+      return `
+      <div class="wallet-filter-row" data-wallet="${wallet}">
+        <div class="wallet-filter-head">
+          <input type="text" class="wallet-name-input" placeholder="add a name…" data-action="name" value="${nameValue}" />
+          <span class="addr">${shorten(wallet)}</span>
+          <span class="wallet-badge ${override ? "custom" : "global"}">${override ? "Custom" : "Using Global"}</span>
+          <button class="wallet-toggle-btn" data-action="toggle">${isOpen ? "Hide" : "Edit"}</button>
+        </div>
+        <div class="wallet-filter-body${isOpen ? " open" : ""}">
+          ${fieldsHtml}
+          <button class="save-btn" data-action="save">Save</button>
+          <button class="wallet-reset-btn" data-action="reset" ${override ? "" : "disabled"}>Reset to Global</button>
+          <span class="wallet-filter-status"></span>
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  attachWalletFilterHandlers(container);
+}
+
+function attachWalletFilterHandlers(root) {
+  for (const row of root.querySelectorAll(".wallet-filter-row[data-wallet]")) {
+    const wallet = row.dataset.wallet;
+    const body = row.querySelector(".wallet-filter-body");
+    const statusEl = row.querySelector(".wallet-filter-status");
+
+    row.querySelector('[data-action="toggle"]')?.addEventListener("click", () => {
+      const willOpen = !body.classList.contains("open");
+      body.classList.toggle("open", willOpen);
+      row.querySelector('[data-action="toggle"]').textContent = willOpen ? "Hide" : "Edit";
+      if (willOpen) expandedWallets.add(wallet);
+      else expandedWallets.delete(wallet);
+    });
+
+    const nameInput = row.querySelector('[data-action="name"]');
+    if (nameInput) {
+      const commit = async () => {
+        const name = nameInput.value.trim();
+        if ((walletNamesMap[wallet] ?? "") === name) return; // unchanged, nothing to save
+        if (name) walletNamesMap[wallet] = name;
+        else delete walletNamesMap[wallet];
+        await saveWalletName(wallet, name);
+        render(); // any live feed/copy log rows already showing this wallet pick up the new name
+      };
+      nameInput.addEventListener("blur", commit);
+      nameInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") nameInput.blur(); // triggers the blur handler above
+      });
+    }
+
+    row.querySelector('[data-action="save"]')?.addEventListener("click", async () => {
+      const patch = {};
+      for (const input of row.querySelectorAll("input[data-field]")) {
+        const raw = input.value.trim();
+        patch[input.dataset.field] = raw === "" ? null : Number(raw);
+      }
+      try {
+        const res = await fetch(`${API_BASE}/api/settings/wallets/${encodeURIComponent(wallet)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status);
+        walletSettingsMap[wallet] = await res.json();
+        statusEl.textContent = "Saved ✓";
+      } catch (e) {
+        statusEl.textContent = "Failed: " + e.message;
+      }
+      expandedWallets.add(wallet); // stay open through the re-render so the save confirmation is visible
+      renderWalletFilters();
+      setTimeout(() => { row.querySelector(".wallet-filter-status")?.replaceChildren(); }, 3000);
+    });
+
+    row.querySelector('[data-action="reset"]')?.addEventListener("click", async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/settings/wallets/${encodeURIComponent(wallet)}`, { method: "DELETE" });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status);
+        delete walletSettingsMap[wallet];
+      } catch (e) {
+        statusEl.textContent = "Failed: " + e.message;
+      }
+      expandedWallets.add(wallet);
+      renderWalletFilters();
+    });
+  }
 }
 
 function connectWs() {
@@ -507,7 +698,7 @@ function connectWs() {
         addFeedItem("status", `[${msg.payload.source}] ${msg.payload.status}${msg.payload.detail ? " — " + msg.payload.detail : ""}`);
         break;
       case "trade":
-        addFeedItem("status", `[${msg.payload.venue}] ${msg.payload.direction.toUpperCase()} ${mintLabel(msg.payload.mint)} by ${shorten(msg.payload.trader)} — ${msg.payload.solAmount.toFixed(4)} SOL`);
+        addFeedItem("status", `[${msg.payload.venue}] ${msg.payload.direction.toUpperCase()} ${mintLabel(msg.payload.mint)} by ${walletLabel(msg.payload.trader)} — ${msg.payload.solAmount.toFixed(4)} SOL`);
         break;
       case "buy":
         state.positions = state.positions.filter((p) => p.id !== msg.payload.id).concat(msg.payload);
@@ -539,12 +730,28 @@ function connectWs() {
       case "settings":
         applySettingsToInputs(msg.payload);
         break;
+      case "walletSettingsAll":
+        walletSettingsMap = msg.payload;
+        renderWalletFilters();
+        break;
+      case "walletSettings":
+        if (msg.payload.settings === null) delete walletSettingsMap[msg.payload.wallet];
+        else walletSettingsMap[msg.payload.wallet] = msg.payload.settings;
+        renderWalletFilters();
+        break;
+      case "walletNamesAll":
+        walletNamesMap = msg.payload;
+        renderWalletFilters();
+        render();
+        break;
     }
   };
 }
 
 loadState();
 loadSettings();
+loadWalletSettings();
+loadWalletNames();
 connectWs();
 setInterval(() => { if (state.positions.some((p) => p.status === "open")) render(); }, 5000); // refresh age counters
 </script>
