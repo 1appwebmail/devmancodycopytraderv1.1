@@ -1,4 +1,4 @@
-# Devmancody CopyTrader
+# Solana CopyTrader Bot - Pump.fun and PumpSwap - Copytrading Bot - Paper and Live Mode
 
 [![CI](https://github.com/1appwebmail/devmancodycopytraderv1.1/actions/workflows/ci.yml/badge.svg)](https://github.com/1appwebmail/devmancodycopytraderv1.1/actions/workflows/ci.yml)
 
@@ -72,6 +72,7 @@ Every setting is documented inline in [`.env.example`](.env.example) — copy it
 - **Your private key never leaves your machine.** `LIVE_PRIVATE_KEY` is read from your local `.env` and used only to sign transactions locally — it is never transmitted anywhere by this code. Still, treat the machine running it accordingly (don't run it on shared/untrusted infrastructure, don't commit `.env`).
 - **Start small.** `LIVE_MAX_POSITION_SOL`, `LIVE_MAX_TOTAL_SOL_AT_RISK`, and `LIVE_MIN_SOL_RESERVE` are hard caps enforced before any transaction is built — set them deliberately, not to whatever your wallet happens to hold.
 - **This is not financial advice**, and copying a wallet's trades is not a guarantee of profit — a target wallet can lose money too, and execution latency/slippage means your fill is never identical to theirs.
+- Telegram - https://t.me/devmancody
 
 ## License
 
