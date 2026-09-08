@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit -p .
+
+      # Pure-logic unit tests only (strategy/paper-executor/positionManager/tradeLog/targetHoldings)
+      # — no network access, no real .env needed. The test:* scripts (decode/grpc/live:*) hit live
+      # RPC/gRPC endpoints and a funded wallet, so they're deliberately excluded from CI.
+      - name: Unit tests
+        run: npm test
